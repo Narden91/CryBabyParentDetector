@@ -17,6 +17,8 @@ from detection.advanced import AdvancedFeatureDetector
 from detection.ml import MLDetector
 from audio.player import AudioPlayer
 from audio.processing import extract_audio_features, preprocess_audio
+from detection.dl import DLDetector
+
 
 class BabyCryDetector:
     """Baby cry detector that uses different detection methods and plays audio on detection."""
@@ -91,7 +93,7 @@ class BabyCryDetector:
         Setup the appropriate detector based on method.
         
         Args:
-            method: Detection method ("simple", "advanced", "ml")
+            method: Detection method ("simple", "advanced", "ml", "dl")
             model_path: Path to ML model file (required for "ml" method)
         """
         if method == "simple":
@@ -103,7 +105,10 @@ class BabyCryDetector:
                 raise ValueError("Model path is required for ML detection")
             # MLDetector will create a dummy model if the file doesn't exist
             self.detector = MLDetector(model_path=model_path, threshold=self.threshold, 
-                                      create_dummy_model=True)
+                                    create_dummy_model=True)
+        elif method == "dl":
+            # Deep Learning detector doesn't need a model path as it downloads from HF
+            self.detector = DLDetector(threshold=self.threshold)
         else:
             raise ValueError(f"Unknown detection method: {method}")
     

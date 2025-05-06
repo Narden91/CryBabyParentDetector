@@ -173,7 +173,7 @@ with gr.Blocks(title="Baby Cry Detector") as app:
             with gr.Group():
                 gr.Markdown("### Detection Method")
                 detection_method = gr.Radio(
-                    choices=["simple", "advanced", "ml"], 
+                    choices=["simple", "advanced", "ml", "dl"], 
                     value="simple", 
                     label="Detection Method",
                     info="Select which detection algorithm to use"
@@ -248,6 +248,7 @@ with gr.Blocks(title="Baby Cry Detector") as app:
        - **Simple Level Detection**: Triggered when audio level exceeds threshold
        - **Advanced Feature Detection**: Uses audio features for more accurate baby cry detection
        - **ML Detection**: Uses a pre-trained machine learning model for highest accuracy
+       - **DL Detection**: Uses a pre-trained deep learning model from Hugging Face for highest accuracy
     3. Choose a playback mode:
        - **Random**: Plays a random file each time
        - **Sequential**: Cycles through files in order
