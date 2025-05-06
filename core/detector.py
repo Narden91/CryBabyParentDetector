@@ -299,68 +299,69 @@ class BabyCryDetector:
         Returns:
             matplotlib.Figure: Plot figure
         """
-        fig = plt.figure(figsize=(6, 3))
-        ax = fig.add_subplot(111)
-        
-        # Plot audio waveform
-        x = np.arange(len(self.audio_data_for_plot))
-        ax.plot(x, self.audio_data_for_plot, color='blue', alpha=0.7)
-        
-        # Add threshold indicator based on detection method
-        detector_class = self.detector.__class__.__name__
-        if detector_class == "SimpleLevelDetector":
-            threshold_line = self.simple_threshold / 50  # Scale to fit in plot range [-1, 1]
-            ax.axhline(y=threshold_line, color='red', linestyle='--', alpha=0.7, 
-                      label=f"Threshold ({self.simple_threshold:.2f})")
-            ax.legend(loc='upper right', fontsize='x-small')
-        
-        # Add current audio level indicator with color coding
-        level = self.current_audio_level
-        if level < 0.3:
-            level_color = 'green'
-        elif level < 0.7:
-            level_color = 'orange'
-        else:
-            level_color = 'red'
+        with plt.rc_context({'backend': 'Agg'}):
+            fig = plt.figure(figsize=(6, 3))
+            ax = fig.add_subplot(111)
             
-        # Add level bar at the bottom
-        level_width = len(self.audio_data_for_plot) * (level)
-        rect = plt.Rectangle((0, -0.95), level_width, 0.1, color=level_color, alpha=0.7)
-        ax.add_patch(rect)
-        
-        # Add level text
-        ax.text(len(self.audio_data_for_plot)*0.05, -0.9, 
-                f"Level: {level:.2f}", color='black', fontsize=8,
-                bbox=dict(facecolor='white', alpha=0.7))
-        
-        # Format plot
-        ax.set_ylim(-1, 1)
-        ax.set_xlim(0, len(self.audio_data_for_plot))
-        ax.set_xlabel("Sample")
-        ax.set_ylabel("Amplitude")
-        ax.grid(True, alpha=0.3)
-        
-        # Add detection method and microphone info
-        detector_name = self.get_detector_name()
-        ax.text(0.02, 0.95, f"Mode: {detector_name} | Mic: {self.current_mic_name}", 
-                transform=ax.transAxes, fontsize=8, 
-                bbox=dict(facecolor='white', alpha=0.7))
-        
-        # Add audio files count
-        ax.text(0.02, 0.90, f"Audio files: {len(self.voice_files)} ({self.playback_mode} mode)", 
-                transform=ax.transAxes, fontsize=8, 
-                bbox=dict(facecolor='white', alpha=0.7))
-        
-        # Highlight when crying is detected
-        if time.time() - self.last_detected < 3:
-            ax.set_facecolor((1.0, 0.9, 0.9))
-            ax.text(0.5, 0.5, 'Crying detected!', horizontalalignment='center',
-                    verticalalignment='center', transform=ax.transAxes,
-                    color='red', fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
-        
-        plt.tight_layout()
-        plt.close(fig)
-        return fig
+            # Plot audio waveform
+            x = np.arange(len(self.audio_data_for_plot))
+            ax.plot(x, self.audio_data_for_plot, color='blue', alpha=0.7)
+            
+            # Add threshold indicator based on detection method
+            detector_class = self.detector.__class__.__name__
+            if detector_class == "SimpleLevelDetector":
+                threshold_line = self.simple_threshold / 50  # Scale to fit in plot range [-1, 1]
+                ax.axhline(y=threshold_line, color='red', linestyle='--', alpha=0.7, 
+                        label=f"Threshold ({self.simple_threshold:.2f})")
+                ax.legend(loc='upper right', fontsize='x-small')
+            
+            # Add current audio level indicator with color coding
+            level = self.current_audio_level
+            if level < 0.3:
+                level_color = 'green'
+            elif level < 0.7:
+                level_color = 'orange'
+            else:
+                level_color = 'red'
+                
+            # Add level bar at the bottom
+            level_width = len(self.audio_data_for_plot) * (level)
+            rect = plt.Rectangle((0, -0.95), level_width, 0.1, color=level_color, alpha=0.7)
+            ax.add_patch(rect)
+            
+            # Add level text
+            ax.text(len(self.audio_data_for_plot)*0.05, -0.9, 
+                    f"Level: {level:.2f}", color='black', fontsize=8,
+                    bbox=dict(facecolor='white', alpha=0.7))
+            
+            # Format plot
+            ax.set_ylim(-1, 1)
+            ax.set_xlim(0, len(self.audio_data_for_plot))
+            ax.set_xlabel("Sample")
+            ax.set_ylabel("Amplitude")
+            ax.grid(True, alpha=0.3)
+            
+            # Add detection method and microphone info
+            detector_name = self.get_detector_name()
+            ax.text(0.02, 0.95, f"Mode: {detector_name} | Mic: {self.current_mic_name}", 
+                    transform=ax.transAxes, fontsize=8, 
+                    bbox=dict(facecolor='white', alpha=0.7))
+            
+            # Add audio files count
+            ax.text(0.02, 0.90, f"Audio files: {len(self.voice_files)} ({self.playback_mode} mode)", 
+                    transform=ax.transAxes, fontsize=8, 
+                    bbox=dict(facecolor='white', alpha=0.7))
+            
+            # Highlight when crying is detected
+            if time.time() - self.last_detected < 3:
+                ax.set_facecolor((1.0, 0.9, 0.9))
+                ax.text(0.5, 0.5, 'Crying detected!', horizontalalignment='center',
+                        verticalalignment='center', transform=ax.transAxes,
+                        color='red', fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+            
+            plt.tight_layout()
+            plt.close(fig)
+            return fig
 
     def set_microphone(self, mic_id) -> str:
         """

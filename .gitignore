@@ -1,0 +1,22 @@
+# Python files 
+__pycache__/
+*.pyo
+*.pyd
+*.pyc
+*.pdb
+*.egg-info
+*.egg
+*.whl
+*.manifest
+*.spec
+*.db
+*.sqlite3
+*.DS_Store
+*.coverage
+*.cover
+*.tox
+*.nox
+*.coverage.*
+*.hypothesis/
+
+
