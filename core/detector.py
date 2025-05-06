@@ -107,8 +107,12 @@ class BabyCryDetector:
             self.detector = MLDetector(model_path=model_path, threshold=self.threshold, 
                                     create_dummy_model=True)
         elif method == "dl":
-            # Deep Learning detector doesn't need a model path as it downloads from HF
-            self.detector = DLDetector(threshold=self.threshold)
+            # Aggiornamento: ora possiamo specificare il modello da utilizzare
+            self.detector = DLDetector(
+                threshold=self.threshold,
+                model_name="microsoft/wavlm-base-plus",  # Modello più affidabile
+                cache_dir=os.path.join("models", "huggingface")  # Cache locale
+            )
         else:
             raise ValueError(f"Unknown detection method: {method}")
     
