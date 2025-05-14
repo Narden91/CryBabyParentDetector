@@ -3,16 +3,16 @@ import threading
 import queue
 import numpy as np
 import pyaudio
-# import wave
+import random
 import time
-from panns_inference import SoundEventDetection, labels # Assuming this is in the same directory or installed
+from panns_inference import SoundEventDetection, labels 
 from pydub import AudioSegment
 from pydub.playback import play
-# import io
-import os # For checking file existence
-import traceback # For detailed error logging
+import os 
+import traceback 
 
-# Ensure PyTorch is imported for device checks, as PANNs relies on it.
+
+# ── Parametri Gradio ───────────────────────────────────────────
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -33,7 +33,7 @@ try:
 except ValueError:
     print("ERROR: 'Baby cry, infant cry' not found in labels. PANNs labels might be different.")
     print(f"Available labels (first 10): {labels[:10]}")
-    BABY_IDX = -1 # Indicate error
+    BABY_IDX = -1 
 
 # ── Modello (Load once) ─────────────────────────────────────────
 WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "weights/Cnn14_DecisionLevelMax_mAP=0.385.pth")
@@ -63,8 +63,8 @@ else:
     print("Model not loaded due to BABY_IDX issue.")
 
 
-# ── Funzione principale di detection (modificata per Gradio) ────
-def run_baby_cry_detection(mother_audio_path, stop_event_trigger, progress=gr.Progress(track_tqdm=True)):
+# ── Funzione principale di detection ────
+def run_baby_cry_detection(mother_audio_paths, stop_event_trigger, progress=gr.Progress(track_tqdm=True)):
     global shared_stop_event
 
     if sed_model is None or BABY_IDX == -1:
@@ -82,8 +82,8 @@ def run_baby_cry_detection(mother_audio_path, stop_event_trigger, progress=gr.Pr
         }
         return
 
-    if not mother_audio_path:
-        yield "ERROR: Please upload a mother's voice MP3."
+    if not mother_audio_paths or len(mother_audio_paths) == 0:
+        yield "ERROR: Please upload at least one mother's voice MP3."
         yield {
             status_display: gr.Textbox(value="Error: No mother's voice provided", interactive=False),
             start_button: gr.Button(value="Start Monitoring", visible=True, interactive=True),
@@ -91,27 +91,36 @@ def run_baby_cry_detection(mother_audio_path, stop_event_trigger, progress=gr.Pr
         }
         return
 
-    try:
-        mother_segment = AudioSegment.from_file(mother_audio_path)
-    except Exception as e:
-        yield f"ERROR: Could not load mother's audio: {e}"
+    mother_segments = []
+    for audio_path in mother_audio_paths:
+        try:
+            segment = AudioSegment.from_file(audio_path)
+            mother_segments.append(segment)
+            yield f"✓ Loaded: {os.path.basename(audio_path)}"
+        except Exception as e:
+            yield f"ERROR loading {os.path.basename(audio_path)}: {e}"
+    
+    if len(mother_segments) == 0:
+        yield "ERROR: None of the uploaded audio files could be loaded."
         yield {
-            status_display: gr.Textbox(value="Error: Invalid mother's audio", interactive=False),
+            status_display: gr.Textbox(value="Error: No valid audio files", interactive=False),
             start_button: gr.Button(value="Start Monitoring", visible=True, interactive=True),
             stop_button: gr.Button(value="Stop Monitoring", visible=False, interactive=False),
         }
         return
+    
+    yield f"Successfully loaded {len(mother_segments)} mother's voice recordings."
 
     shared_stop_event.clear()
-    audio_queue = queue.Queue(maxsize=10) # Maxsize to prevent excessive memory if inference is slow
+    audio_queue = queue.Queue(maxsize=10) 
     log_queue = queue.Queue()
 
-    # ── Worker detection (CORRECTED SECTION based on 3D output) ───
+    # ── Worker detection ───
     def inference_worker():
         while not shared_stop_event.is_set():
             try:
                 batch = audio_queue.get(timeout=0.1)
-                if batch is None: # Sentinel value
+                if batch is None: 
                     break
                 
                 if batch.ndim == 1:
@@ -188,7 +197,8 @@ def run_baby_cry_detection(mother_audio_path, stop_event_trigger, progress=gr.Pr
                     log_msg += f"  🚨 Baby cry detected! (thresh: {THRESHOLD})"
                     log_queue.put(log_msg)
                     try:
-                        play(mother_segment) # This is blocking
+                        selected_segment = random.choice(mother_segments)
+                        play(selected_segment) 
                     except Exception as e:
                         log_queue.put(f"Error playing mother's voice: {e}")
                 else:
@@ -201,7 +211,7 @@ def run_baby_cry_detection(mother_audio_path, stop_event_trigger, progress=gr.Pr
             except Exception as e:
                 tb_str = traceback.format_exc()
                 log_queue.put(f"FATAL Error in inference worker: {e}\nTraceback:\n{tb_str}")
-                shared_stop_event.set() # Stop main loop if worker fails badly
+                shared_stop_event.set()
                 break 
         log_queue.put("Inference worker stopped.")
     # ── End of corrected inference_worker ──────────────────────
@@ -214,7 +224,7 @@ def run_baby_cry_detection(mother_audio_path, stop_event_trigger, progress=gr.Pr
     stream = None
     try:
         pa = pyaudio.PyAudio()
-        input_device_index = pa.get_default_input_device_info()['index'] # Use default input
+        input_device_index = pa.get_default_input_device_info()['index'] 
         
         stream = pa.open(format=pyaudio.paInt16,
                          channels=1,
@@ -362,8 +372,8 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary
     gr.Markdown(
         """
         # 👶 Baby Cry Detector 🎶
-        Upload a mother's voice (MP3). Click "Start Monitoring" to listen via your microphone.
-        When a baby cry is detected, the mother's voice will play.
+        Upload one or more mother's voice MP3 files. Click "Start Monitoring" to listen via your microphone.
+        When a baby cry is detected, a random mother's voice recording will play.
         Logs and scores appear below.
         """
     )
@@ -379,10 +389,10 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary
 
     with gr.Row():
         with gr.Column(scale=1):
-            mother_audio_input = gr.Audio(
-                label="Upload Mom's Voice (MP3)",
-                type="filepath",
-                sources=["upload"]
+            mother_audio_input = gr.Files(
+                label="Upload Mom's Voice Files (MP3)",
+                file_types=["audio"],
+                file_count="multiple"
             )
             start_button = gr.Button("Start Monitoring", variant="primary", visible=True, interactive=sed_model is not None and BABY_IDX !=-1)
             stop_button = gr.Button("Stop Monitoring", variant="stop", visible=False)
