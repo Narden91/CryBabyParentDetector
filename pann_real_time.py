@@ -18,7 +18,7 @@ BABY_IDX    = labels.index("Baby cry, infant cry")
 
 # ── Model ────────────────────────────────────────────────────────────────────
 sed = SoundEventDetection(
-    checkpoint_path="/Users/cesaredavidepace/Desktop/Progetti/BabyCryDetector/weights/Cnn14_DecisionLevelMax_mAP=0.385.pth",
+    checkpoint_path=r"C:\Users\Emanuele\Documents\Progetti Python\CryBabyParentDetector\weights\Cnn14_DecisionLevelMax_mAP=0.385.pth",
     device="mps"
 )
 
