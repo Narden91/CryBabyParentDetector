@@ -14,15 +14,15 @@ import io
 SR = 32000
 WINDOW_SEC = 2.0
 HOP_SEC = 3.0
-THRESHOLD = 0.1
+THRESHOLD = 0.2
 WINDOW_SIZE = int(WINDOW_SEC * SR)
 HOP_SIZE = int(HOP_SEC * SR)
 BABY_IDX = labels.index("Baby cry, infant cry")
 
 # ── Modello ─────────────────────────────────────────────────────
 sed = SoundEventDetection(
-    checkpoint_path="weights/Cnn14_DecisionLevelMax_mAP=0.385.pth",  # Adatta il path se serve
-    device="cpu"  # usa 'mps' se sei su Mac con Metal
+    checkpoint_path="weights/Cnn14_DecisionLevelMax_mAP=0.385.pth", 
+    device="cuda"  
 )
 
 
