@@ -1,0 +1,6 @@
+gradio
+numpy
+PyAudio
+panns_inference
+pydub
+torch
