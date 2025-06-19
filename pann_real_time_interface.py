@@ -3,444 +3,351 @@ import threading
 import queue
 import numpy as np
 import pyaudio
-import random
+import wave
 import time
-from panns_inference import SoundEventDetection, labels 
+from panns_inference import SoundEventDetection, labels
 from pydub import AudioSegment
 from pydub.playback import play
-import os 
-import traceback 
+import io
 
-
-# ── Parametri Gradio ───────────────────────────────────────────
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    print("WARNING: PyTorch is not installed. PANNs inference will likely fail or run on CPU by default if model manages to load.")
-    TORCH_AVAILABLE = False
-
-
-# ── Parametri audio ─────────────────────────────────────────────
+# ── Parametri Audio ──────────────────────────────────
 SR = 32000
 WINDOW_SEC = 2.0
-HOP_SEC = 1.0 # Using 1.0s hop for 1s overlap with 2s window
-THRESHOLD = 0.2
+HOP_SEC = 1.0
+THRESHOLD = 0.2  # Soglia fissa come richiesto
 WINDOW_SIZE = int(WINDOW_SEC * SR)
 HOP_SIZE = int(HOP_SEC * SR)
-try:
-    BABY_IDX = labels.index("Baby cry, infant cry")
-except ValueError:
-    print("ERROR: 'Baby cry, infant cry' not found in labels. PANNs labels might be different.")
-    print(f"Available labels (first 10): {labels[:10]}")
-    BABY_IDX = -1 
+BABY_IDX = labels.index("Baby cry, infant cry")
 
-# ── Modello (Load once) ─────────────────────────────────────────
-WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "weights/Cnn14_DecisionLevelMax_mAP=0.385.pth")
-sed_model = None
+# ── Code Globale per la gestione dello stato ───────────────────────
+audio_queue = queue.Queue()
+result_queue = queue.Queue()
+app_state = {
+    "stop_event": None,
+    "inference_thread": None,
+    "pyaudio_thread": None
+}
 
-if BABY_IDX != -1: # Only load model if Baby_IDX is valid
-    if not os.path.exists(WEIGHTS_PATH):
-        print(f"ERROR: Weights file not found at {WEIGHTS_PATH}")
-    else:
+# ── Modello (caricato una sola volta) ──────────────────────────────
+print("Caricamento modello di sound detection...")
+sed = SoundEventDetection(
+    checkpoint_path="weights/Cnn14_DecisionLevelMax_mAP=0.385.pth",
+    device="cpu"
+)
+print("Modello caricato.")
+
+
+# ── Worker per l'inferenza ───────────────
+def inference_worker(mother_segment, stop_event):
+    """Esegue l'inferenza sui dati audio e mette i risultati in una coda."""
+    while not stop_event.is_set():
         try:
-            device = "cpu"
-            if TORCH_AVAILABLE:
-                if torch.cuda.is_available():
-                    device = "cuda"
-                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available(): # For Apple Silicon
-                    device = "mps"
-            
-            sed_model = SoundEventDetection(
-                checkpoint_path=WEIGHTS_PATH,
-                device=device
-            )
-            print(f"PANNs model loaded successfully on {device}.")
-        except Exception as e:
-            print(f"Error loading PANNs model: {e}")
-            traceback.print_exc()
-else:
-    print("Model not loaded due to BABY_IDX issue.")
+            batch = audio_queue.get(timeout=1)
+            if batch is None: break
+
+            framewise = sed.inference(batch)[0]
+            score = np.max(framewise, axis=0)[BABY_IDX]
+
+            detected = score > THRESHOLD
+            result_queue.put({"score": score, "detected": detected})
+
+            if detected:
+                print(f"PIANTO RILEVATO (Score: {score:.2f}) - Riproduco audio.")
+                play(mother_segment)
+
+            audio_queue.task_done()
+        except queue.Empty:
+            continue
 
 
-# ── Funzione principale di detection ────
-def run_baby_cry_detection(mother_audio_paths, stop_event_trigger, progress=gr.Progress(track_tqdm=True)):
-    global shared_stop_event
+# ── Worker per la cattura audio ───────────────────────────
+def pyaudio_worker(stop_event):
+    """Cattura l'audio dal microfono e lo mette nella coda audio."""
+    pa = pyaudio.PyAudio()
+    stream = pa.open(format=pyaudio.paInt16, channels=1, rate=SR, input=True, frames_per_buffer=HOP_SIZE)
 
-    if sed_model is None or BABY_IDX == -1:
-        err_msg = "ERROR: PANNs model not loaded"
-        if BABY_IDX == -1:
-            err_msg += " (Baby cry label not found)."
-        else:
-            err_msg += "."
-        err_msg += " Cannot start detection."
-        yield err_msg
-        yield {
-            status_display: gr.Textbox(value="Error: Model/Label Issue", interactive=False),
-            start_button: gr.Button(value="Start Monitoring", visible=True, interactive=True),
-            stop_button: gr.Button(value="Stop Monitoring", visible=False, interactive=False),
-        }
-        return
+    print("🎧 In ascolto...")
+    buffer = np.zeros((0,), dtype="float32")
 
-    if not mother_audio_paths or len(mother_audio_paths) == 0:
-        yield "ERROR: Please upload at least one mother's voice MP3."
-        yield {
-            status_display: gr.Textbox(value="Error: No mother's voice provided", interactive=False),
-            start_button: gr.Button(value="Start Monitoring", visible=True, interactive=True),
-            stop_button: gr.Button(value="Stop Monitoring", visible=False, interactive=False),
-        }
-        return
+    while not stop_event.is_set():
+        raw = stream.read(HOP_SIZE, exception_on_overflow=False)
+        mono = np.frombuffer(raw, dtype=np.int16).astype("float32") / 32768.0
+        buffer = np.concatenate((buffer, mono))
+        while len(buffer) >= WINDOW_SIZE:
+            segment = buffer[:WINDOW_SIZE]
+            audio_queue.put(segment[np.newaxis, :])
+            buffer = buffer[HOP_SIZE:]
 
-    mother_segments = []
-    for audio_path in mother_audio_paths:
-        try:
-            segment = AudioSegment.from_file(audio_path)
-            mother_segments.append(segment)
-            yield f"✓ Loaded: {os.path.basename(audio_path)}"
-        except Exception as e:
-            yield f"ERROR loading {os.path.basename(audio_path)}: {e}"
-    
-    if len(mother_segments) == 0:
-        yield "ERROR: None of the uploaded audio files could be loaded."
-        yield {
-            status_display: gr.Textbox(value="Error: No valid audio files", interactive=False),
-            start_button: gr.Button(value="Start Monitoring", visible=True, interactive=True),
-            stop_button: gr.Button(value="Stop Monitoring", visible=False, interactive=False),
-        }
-        return
-    
-    yield f"Successfully loaded {len(mother_segments)} mother's voice recordings."
+    stream.stop_stream()
+    stream.close()
+    pa.terminate()
+    print("🔴 Ascolto terminato.")
 
-    shared_stop_event.clear()
-    audio_queue = queue.Queue(maxsize=10) 
-    log_queue = queue.Queue()
 
-    # ── Worker detection ───
-    def inference_worker():
-        while not shared_stop_event.is_set():
-            try:
-                batch = audio_queue.get(timeout=0.1)
-                if batch is None: 
-                    break
-                
-                if batch.ndim == 1:
-                    batch = batch[np.newaxis, :] # Ensure (1, num_samples)
-                
-                # Perform inference.
-                # Based on user's error log, sed_model.inference(batch) *directly*
-                # returns a 3D NumPy array (batch_size, num_frames, num_classes).
-                # Or it could be a list/tuple containing this array as the first element.
-                model_output_raw = sed_model.inference(batch)
-                
-                model_output_np = None
-                if isinstance(model_output_raw, np.ndarray):
-                    model_output_np = model_output_raw
-                elif isinstance(model_output_raw, (list, tuple)) and model_output_raw:
-                    # If it's a list/tuple, assume the framewise data is the first element
-                    # This aligns with the original script's sed.inference(batch)[0]
-                    if isinstance(model_output_raw[0], np.ndarray):
-                        model_output_np = model_output_raw[0]
-                    else:
-                        log_queue.put(f"Warning: Inference result was list/tuple, but first element not np.ndarray. Type: {type(model_output_raw[0])}")
-                        audio_queue.task_done()
-                        continue
-                else:
-                    log_queue.put(f"Warning: Inference did not return np.ndarray or list/tuple. Type: {type(model_output_raw)}")
-                    audio_queue.task_done()
-                    continue
+# ── Funzioni per l'interfaccia Gradio ────────────────────────────
+def start_detection(mother_audio_path):
+    """Funzione chiamata dal pulsante 'Avvia'."""
+    if app_state["inference_thread"] is not None and app_state["inference_thread"].is_alive():
+        return "Il monitoraggio è già attivo.", "🟢 In Ascolto", "rgba(34, 139, 34, 0.1)", 0.0
 
-                if model_output_np is None or model_output_np.size == 0:
-                    log_queue.put("Warning: Inference resulted in empty or invalid data.")
-                    audio_queue.task_done()
-                    continue
-                
-                # Now, model_output_np is expected to be our primary data,
-                # likely shape (1, num_frames, num_classes) or already (num_frames, num_classes)
-                actual_framewise_2d = None
-                if model_output_np.ndim == 3:
-                    if model_output_np.shape[0] == 1: # e.g., (1, 201, 527)
-                        actual_framewise_2d = model_output_np[0] # Squeeze batch dim -> (201, 527)
-                    else:
-                        # Unlikely for our batch_size=1 input, but handle defensively
-                        log_queue.put(f"Warning: Inference output 3D with batch_size > 1: {model_output_np.shape}. Taking max over batch dim.")
-                        actual_framewise_2d = np.max(model_output_np, axis=0)
-                elif model_output_np.ndim == 2: # Already (num_frames, num_classes)
-                    actual_framewise_2d = model_output_np
-                else:
-                    log_queue.put(f"Warning: Unexpected inference output dimensions after processing: {model_output_np.shape}. Expected 3D or 2D array.")
-                    audio_queue.task_done()
-                    continue
-                
-                if actual_framewise_2d is None or actual_framewise_2d.ndim != 2:
-                    log_queue.put(f"Error: Could not resolve framewise data to 2D. Original shape: {model_output_np.shape}")
-                    audio_queue.task_done()
-                    continue
-                
-                # --- Scoring logic using actual_framewise_2d ---
-                num_frames_out, num_classes_out = actual_framewise_2d.shape
-                if num_classes_out <= BABY_IDX:
-                    log_queue.put(f"Warning: Framewise data has {num_classes_out} classes, insufficient for BABY_IDX ({BABY_IDX}). Shape: {actual_framewise_2d.shape}")
-                    audio_queue.task_done()
-                    continue
+    if mother_audio_path is None:
+        raise gr.Error("Per favore, carica prima il file audio della mamma.")
 
-                max_probs_per_class_in_window = np.max(actual_framewise_2d, axis=0) # Shape: (num_classes,)
-                
-                if BABY_IDX >= len(max_probs_per_class_in_window): # Defensive check
-                    log_queue.put(f"Error: BABY_IDX ({BABY_IDX}) out of bounds for class probabilities (len {len(max_probs_per_class_in_window)}).")
-                    audio_queue.task_done()
-                    continue
-                
-                score = max_probs_per_class_in_window[BABY_IDX]
-                
-                log_msg = f"Baby-cry score: {score:.2f}"
-                if score > THRESHOLD:
-                    log_msg += f"  🚨 Baby cry detected! (thresh: {THRESHOLD})"
-                    log_queue.put(log_msg)
-                    try:
-                        selected_segment = random.choice(mother_segments)
-                        play(selected_segment) 
-                    except Exception as e:
-                        log_queue.put(f"Error playing mother's voice: {e}")
-                else:
-                    log_msg += "  (no cry)"
-                    log_queue.put(log_msg)
-                audio_queue.task_done()
+    # Pulisci le code prima di iniziare
+    while not audio_queue.empty(): audio_queue.get()
+    while not result_queue.empty(): result_queue.get()
 
-            except queue.Empty:
-                continue 
-            except Exception as e:
-                tb_str = traceback.format_exc()
-                log_queue.put(f"FATAL Error in inference worker: {e}\nTraceback:\n{tb_str}")
-                shared_stop_event.set()
-                break 
-        log_queue.put("Inference worker stopped.")
-    # ── End of corrected inference_worker ──────────────────────
+    mother_segment = AudioSegment.from_file(mother_audio_path)
 
-    worker = threading.Thread(target=inference_worker, daemon=True)
-    worker.start()
-    yield "Inference worker started."
+    app_state["stop_event"] = threading.Event()
 
-    pa = None
-    stream = None
+    # Avvia il thread di inferenza
+    app_state["inference_thread"] = threading.Thread(
+        target=inference_worker,
+        args=(mother_segment, app_state["stop_event"]),
+        daemon=True
+    )
+    app_state["inference_thread"].start()
+
+    # Avvia il thread di cattura audio
+    app_state["pyaudio_thread"] = threading.Thread(
+        target=pyaudio_worker,
+        args=(app_state["stop_event"],),
+        daemon=True
+    )
+    app_state["pyaudio_thread"].start()
+
+    return "✅ Monitoraggio avviato! In ascolto...", "🟢 In Ascolto", "rgba(34, 139, 34, 0.1)", 0.0
+
+
+def stop_detection():
+    """Funzione chiamata dal pulsante 'Ferma'."""
+    if app_state["stop_event"]:
+        app_state["stop_event"].set()
+
+        # Attendi la terminazione dei thread
+        if app_state["pyaudio_thread"]: app_state["pyaudio_thread"].join(timeout=2)
+        if app_state["inference_thread"]: app_state["inference_thread"].join(timeout=2)
+
+        app_state["stop_event"] = None
+        app_state["inference_thread"] = None
+        app_state["pyaudio_thread"] = None
+
+        return "🔴 Monitoraggio fermato.", "⚫ Spento", "rgba(128, 128, 128, 0.1)", 0.0
+    return "Il monitoraggio non era attivo.", "⚫ Spento", "rgba(128, 128, 128, 0.1)", 0.0
+
+
+def update_ui():
+    """Funzione per aggiornare l'UI in tempo reale."""
     try:
-        pa = pyaudio.PyAudio()
-        input_device_index = pa.get_default_input_device_info()['index'] 
-        
-        stream = pa.open(format=pyaudio.paInt16,
-                         channels=1,
-                         rate=SR,
-                         input=True,
-                         frames_per_buffer=HOP_SIZE,
-                         input_device_index=input_device_index,
-                         stream_callback=None)
+        result = result_queue.get_nowait()
+        score = result['score']
 
-        yield f"🎧 Listening... (Mic: {pa.get_device_info_by_index(input_device_index)['name']}, SR: {SR}, Win: {WINDOW_SEC}s, Hop: {HOP_SEC}s)"
-        
-        buffer = np.zeros((0,), dtype="float32")
-        stream.start_stream()
+        if result['detected']:
+            status_text = "🚨 PIANTO RILEVATO!"
+            bg_color = "rgba(255, 0, 0, 0.2)"  # Rosso con trasparenza
+            return status_text, bg_color, score
+        else:
+            status_text = "🟢 In Ascolto"
+            bg_color = "rgba(34, 139, 34, 0.1)"  # Verde con trasparenza
+            return status_text, bg_color, score
 
-        while not shared_stop_event.is_set():
-            try:
-                while not log_queue.empty():
-                    yield log_queue.get_nowait()
-                
-                if not stream.is_active() and not shared_stop_event.is_set(): # Check if stream died unexpectedly
-                    yield "ERROR: PyAudio stream is not active. Restarting might be needed."
-                    shared_stop_event.set()
-                    break
+    except queue.Empty:
+        # Se non ci sono nuovi risultati, mantieni lo stato attuale
+        return gr.skip(), gr.skip(), gr.skip()
 
-                raw_data = stream.read(HOP_SIZE, exception_on_overflow=False)
-                mono_data = np.frombuffer(raw_data, dtype=np.int16).astype("float32") / 32768.0
-                buffer = np.concatenate((buffer, mono_data))
-                
-                while len(buffer) >= WINDOW_SIZE:
-                    if shared_stop_event.is_set(): break
-                    segment_to_process = buffer[:WINDOW_SIZE].copy()
-                    try:
-                        audio_queue.put(segment_to_process, timeout=0.1) # Non-blocking put with timeout
-                    except queue.Full:
-                        log_queue.put("Warning: Audio queue full. Skipping a segment. Inference might be too slow.")
-                    buffer = buffer[HOP_SIZE:] # Slide buffer
-                
-                time.sleep(0.01) # Brief sleep to yield control, reduce CPU in tight loop
 
-            except IOError as e:
-                if hasattr(e, 'errno') and e.errno == pyaudio.paInputOverflowed:
-                    yield "Warning: PyAudio input overflowed. Consider increasing HOP_SIZE or reducing processing load."
-                    buffer = np.zeros((0,), dtype="float32") # Clear buffer on overflow
-                else:
-                    yield f"PyAudio IOError: {e}"
-                    shared_stop_event.set()
-                    break
-            except Exception as e:
-                tb_str = traceback.format_exc()
-                yield f"Error in main audio loop: {e}\nTraceback:\n{tb_str}"
-                shared_stop_event.set()
-                break
-        
-        yield "🔴 Stop signal received by main loop. Shutting down..."
+# ── CSS personalizzato per l'effetto visivo ─────────────────────
+custom_css = """
+.cry-alert {
+    background: linear-gradient(45deg, #ff6b6b, #ff8e8e, #ff6b6b) !important;
+    animation: pulse-red 1s infinite;
+    border: 3px solid #ff0000 !important;
+    border-radius: 15px !important;
+    box-shadow: 0 0 20px rgba(255, 0, 0, 0.5) !important;
+}
 
-    except Exception as e:
-        tb_str = traceback.format_exc()
-        yield f"CRITICAL ERROR during PyAudio setup or main loop: {e}\nTraceback:\n{tb_str}"
-    finally:
-        shared_stop_event.set() # Ensure stop for all threads
-        
-        if stream:
-            try:
-                if stream.is_active(): stream.stop_stream()
-                stream.close()
-                yield "PyAudio stream closed."
-            except Exception as e_stream: yield f"Error closing stream: {e_stream}"
-        if pa:
-            try:
-                pa.terminate()
-                yield "PyAudio terminated."
-            except Exception as e_pa: yield f"Error terminating PyAudio: {e_pa}"
+.listening {
+    background: linear-gradient(45deg, #51cf66, #69db7c, #51cf66) !important;
+    animation: pulse-green 2s infinite;
+    border: 2px solid #228b22 !important;
+    border-radius: 15px !important;
+    box-shadow: 0 0 15px rgba(34, 139, 34, 0.3) !important;
+}
 
-        if 'worker' in locals() and worker.is_alive():
-            log_queue.put("Main loop ending. Signaling worker to stop.")
-            audio_queue.put(None) # Sentinel for worker
-            worker.join(timeout=3.0) # Wait a bit longer
-            if worker.is_alive():
-                yield "Warning: Inference worker did not terminate cleanly after 3s."
-            else:
-                yield "Inference worker joined."
-        
-        # Drain any final logs
-        while not log_queue.empty():
-            try: yield log_queue.get_nowait()
-            except queue.Empty: break
-        
-        yield "👶 Monitoring stopped. Session ended."
-        yield {
-            status_display: gr.Textbox(value="Idle - Session Ended", interactive=False),
-            start_button: gr.Button(value="Start Monitoring", visible=True, interactive=True),
-            stop_button: gr.Button(value="Stop Monitoring", visible=False, interactive=False),
-        }
+.offline {
+    background: rgba(128, 128, 128, 0.1) !important;
+    border: 2px solid #808080 !important;
+    border-radius: 15px !important;
+}
 
-# ── Global state for UI control ───────────────────────────────────
-shared_stop_event = threading.Event()
+@keyframes pulse-red {
+    0% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.05); opacity: 0.8; }
+    100% { transform: scale(1); opacity: 1; }
+}
 
-# ── Gradio UI Functions ───────────────────────────────────────────
-def handle_start_monitoring(mother_audio_path, current_logs):
-    global shared_stop_event
-    shared_stop_event.clear() 
+@keyframes pulse-green {
+    0% { opacity: 0.7; }
+    50% { opacity: 1; }
+    100% { opacity: 0.7; }
+}
 
-    initial_logs = (current_logs if current_logs and isinstance(current_logs, str) else "") 
-    if not initial_logs.endswith("\n\n"): initial_logs += "\n" # Ensure separation
-    initial_logs += "--- New Session Started ---\n"
-    
-    # This first yield updates the UI immediately
-    yield {
-        status_display: gr.Textbox(value="🚀 Initializing...", interactive=False),
-        log_output: gr.Textbox(value=initial_logs, interactive=False, autoscroll=True),
-        start_button: gr.Button(visible=False),
-        stop_button: gr.Button(visible=True, interactive=True),
-    }
+.big-status {
+    font-size: 2.5em !important;
+    font-weight: bold !important;
+    text-align: center !important;
+    padding: 30px !important;
+    margin: 20px 0 !important;
+    min-height: 120px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
 
-    # Then, the generator continues, yielding logs from run_baby_cry_detection
-    accumulated_logs = initial_logs
-    for log_or_update in run_baby_cry_detection(mother_audio_path, None):
-        if isinstance(log_or_update, str):
-            accumulated_logs += log_or_update + "\n"
-            yield {log_output: gr.Textbox(value=accumulated_logs, interactive=False, autoscroll=True)}
-        elif isinstance(log_or_update, dict): # For final status updates
-            if log_output in log_or_update and isinstance(log_or_update[log_output], gr.Textbox) and log_or_update[log_output].value is not None:
-                 accumulated_logs = log_or_update[log_output].value 
-            elif 'log_output' in log_or_update and isinstance(log_or_update['log_output'], str):
-                 accumulated_logs = log_or_update['log_output']
-            yield log_or_update # Pass the dict through
-        time.sleep(0.01) # Allows UI to refresh smoothly
+.score-display {
+    font-size: 1.5em !important;
+    font-weight: bold !important;
+    text-align: center !important;
+    padding: 15px !important;
+    border-radius: 10px !important;
+    background: rgba(240, 240, 240, 0.8) !important;
+}
+"""
 
-def handle_stop_monitoring():
-    global shared_stop_event
-    if shared_stop_event: 
-        shared_stop_event.set()
-    # The run_baby_cry_detection generator will handle the final state update.
-    # This just signals and updates button interactivity.
-    return {
-        status_display: gr.Textbox(value="🛑 Sending stop signal...", interactive=False),
-        stop_button: gr.Button(value="Stopping...", interactive=False)
-    }
-
-def clear_logs_func(): # Renamed to avoid conflict with variable
-    return "" 
-
-# ── Gradio UI Layout ───────────────────────────────────────────
-with gr.Blocks(theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.sky), title="Baby Cry Detector") as demo:
+# ── Interfaccia Gradio con elementi visivi migliorati ─────────────────────
+with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
     gr.Markdown(
         """
         # 👶 Baby Cry Detector 🎶
-        Upload one or more mother's voice MP3 files. Click "Start Monitoring" to listen via your microphone.
-        When a baby cry is detected, a random mother's voice recording will play.
-        Logs and scores appear below.
+        **Soglia di rilevamento fissa: 0.2**
+
+        **Come funziona:**
+        1. Carica un file audio (MP3, WAV) con una voce o una melodia tranquillizzante
+        2. Clicca su **Avvia Monitoraggio** per iniziare l'ascolto
+        3. Quando viene rilevato il pianto, vedrai un grande allarme rosso lampeggiante!
         """
     )
-    
-    model_status_msg = "Idle - Model loaded"
-    if sed_model is None:
-        model_status_msg = "Error - Model NOT loaded, check console!"
-    if BABY_IDX == -1 and sed_model is not None: # Model loaded but label issue
-        model_status_msg = "Error - Model loaded, but 'Baby cry' label NOT found!"
-    elif BABY_IDX == -1 and sed_model is None: # Both failed
-        model_status_msg = "Critical Error - Model & Label failed, check console!"
-
 
     with gr.Row():
         with gr.Column(scale=1):
-            mother_audio_input = gr.Files(
-                label="Upload Mom's Voice Files (MP3)",
-                file_types=["audio"],
-                file_count="multiple"
+            mother_audio_input = gr.Audio(
+                label="🎵 Carica Voce della Mamma (o melodia)",
+                type="filepath"
             )
-            start_button = gr.Button("Start Monitoring", variant="primary", visible=True, interactive=sed_model is not None and BABY_IDX !=-1)
-            stop_button = gr.Button("Stop Monitoring", variant="stop", visible=False)
-            if sed_model is None or BABY_IDX == -1:
-                 gr.Markdown("<p style='color:red;'>⚠️ Monitoring disabled until model/label issue is resolved. Check console logs.</p>")
+            with gr.Row():
+                start_button = gr.Button("▶️ Avvia Monitoraggio", variant="primary", size="lg")
+                stop_button = gr.Button("⏹️ Ferma Monitoraggio", variant="stop", size="lg")
 
+            status_box = gr.Textbox(
+                label="📋 Stato del Sistema",
+                value="Pronto per iniziare...",
+                interactive=False,
+                lines=2
+            )
 
         with gr.Column(scale=2):
-            status_display = gr.Textbox(
-                label="Status",
-                value=model_status_msg,
-                interactive=False,
-                max_lines=1
-            )
-            log_output = gr.Textbox(
-                label="Detection Log",
-                lines=15,
-                interactive=False,
-                autoscroll=True,
-                show_copy_button=True
-            )
-            clear_logs_button = gr.Button("Clear Logs")
+            gr.Markdown("## 🎯 Monitoraggio in Tempo Reale")
 
+            # Grande display dello stato visivo
+            visual_status = gr.HTML(
+                value="""
+                <div class="big-status offline">
+                    ⚫ Sistema Spento
+                </div>
+                """,
+                label="Stato Visivo"
+            )
+
+            # Display del punteggio
+            score_display = gr.HTML(
+                value="""
+                <div class="score-display">
+                    📊 Punteggio: 0.00
+                </div>
+                """,
+                label="Punteggio Rilevamento"
+            )
+
+
+    # Funzione per aggiornare l'HTML dello stato visivo
+    def update_visual_status(status_text, bg_color, score):
+        if "PIANTO RILEVATO" in status_text:
+            css_class = "cry-alert"
+        elif "In Ascolto" in status_text:
+            css_class = "listening"
+        else:
+            css_class = "offline"
+
+        visual_html = f"""
+        <div class="big-status {css_class}">
+            {status_text}
+        </div>
+        """
+
+        score_html = f"""
+        <div class="score-display">
+            📊 Punteggio: {score:.3f} / {THRESHOLD}
+        </div>
+        """
+
+        return visual_html, score_html
+
+
+    # Funzioni semplificate per i pulsanti
+    def start_ui_update(mother_audio_path):
+        status, visual_text, _, score = start_detection(mother_audio_path)
+        visual_html, score_html = update_visual_status(visual_text, "", score)
+        return status, visual_html, score_html
+
+
+    def stop_ui_update():
+        status, visual_text, _, score = stop_detection()
+        visual_html, score_html = update_visual_status(visual_text, "", score)
+        return status, visual_html, score_html
+
+
+    # Aggiornamento UI in tempo reale
+    def update_ui_complete():
+        try:
+            result = result_queue.get_nowait()
+            score = result['score']
+
+            if result['detected']:
+                status_text = "✅ Monitoraggio attivo - PIANTO RILEVATO!"
+                visual_text = "🚨 PIANTO RILEVATO!"
+                visual_html, score_html = update_visual_status(visual_text, "", score)
+                return status_text, visual_html, score_html
+            else:
+                status_text = "✅ Monitoraggio attivo - In ascolto..."
+                visual_text = "🟢 In Ascolto"
+                visual_html, score_html = update_visual_status(visual_text, "", score)
+                return status_text, visual_html, score_html
+
+        except queue.Empty:
+            return gr.skip(), gr.skip(), gr.skip()
+
+
+    # Logica di interazione dei componenti
     start_button.click(
-        fn=handle_start_monitoring,
-        inputs=[mother_audio_input, log_output],
-        outputs=[status_display, log_output, start_button, stop_button], # Outputs must be components
-        show_progress="full"
+        fn=start_ui_update,
+        inputs=[mother_audio_input],
+        outputs=[status_box, visual_status, score_display]
     )
 
     stop_button.click(
-        fn=handle_stop_monitoring,
+        fn=stop_ui_update,
         inputs=None,
-        outputs=[status_display, stop_button], # Components to update
-    )
-    
-    clear_logs_button.click(
-        fn=clear_logs_func, # Use the renamed function
-        inputs=None,
-        outputs=[log_output] # Component to update
+        outputs=[status_box, visual_status, score_display]
     )
 
+    # ───> qui sostituiamo `demo.load(every=0.5)` con un Timer <───
+    timer = gr.Timer(value=0.5)  # ogni 0.5 secondi
+    timer.tick(
+        fn=update_ui_complete,
+        outputs=[status_box, visual_status, score_display]
+    )
+
+# Avvia l'interfaccia
 if __name__ == "__main__":
-    if sed_model is None or BABY_IDX == -1:
-        print("CRITICAL: Model not loaded or 'Baby cry' label not found. Detection will not work.")
-        if not os.path.exists(WEIGHTS_PATH): print(f" - Ensure weights file exists at: {WEIGHTS_PATH}")
-        if not TORCH_AVAILABLE: print(f" - PyTorch might not be installed correctly.")
-        if BABY_IDX == -1 : print(f" - 'Baby cry, infant cry' not found in PANNs labels list.")
-    
-    demo.queue()
-    demo.launch(share=True, debug=True)
+    demo.launch(share=True)
