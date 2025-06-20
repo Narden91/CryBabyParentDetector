@@ -27,15 +27,19 @@ app_state = {
     "stop_event": None,
     "inference_thread": None,
     "pyaudio_thread": None,
-    "last_ui_state": None,  # Per evitare aggiornamenti non necessari
-    "mother_segments": []  # Lista di file audio caricati
+    "last_ui_state": None,  # Memorizza lo stato di rilevamento (True/False)
+    "mother_segments": [],  # Lista di tuple (nome_file, AudioSegment)
+    "monitoring_active": False,  # Flag per lo stato del monitoraggio
+    "current_score": 0.0,  # Score corrente per evitare aggiornamenti non necessari
+    "last_status_text": "",  # Ultimo testo di stato per evitare aggiornamenti
+    "last_visual_html": ""  # Ultimo HTML visivo per evitare aggiornamenti
 }
 
 # ── Modello (caricato una sola volta) ──────────────────────────────
 print("Caricamento modello di sound detection...")
 sed = SoundEventDetection(
     checkpoint_path="weights/Cnn14_DecisionLevelMax_mAP=0.385.pth",
-    device="cpu"
+    device="cuda"
 )
 print("Modello caricato.")
 
@@ -56,8 +60,8 @@ def inference_worker(mother_segments, stop_event):
 
             if detected and mother_segments:
                 # Seleziona casualmente uno dei file audio caricati
-                selected_segment = random.choice(mother_segments)
-                print(f"PIANTO RILEVATO (Score: {score:.2f}) - Riproduco audio casuale.")
+                file_name, selected_segment = random.choice(mother_segments)
+                print(f"PIANTO RILEVATO (Score: {score:.2f}) - Riproduco: {file_name}")
                 play(selected_segment)
 
             audio_queue.task_done()
@@ -90,32 +94,53 @@ def pyaudio_worker(stop_event):
 
 
 # ── Funzioni per la gestione dei file multipli ────────────────────────────
-def add_audio_file(file_path, current_files):
-    """Aggiunge un file audio alla lista."""
-    if file_path is None:
-        return current_files, "⚠️ Nessun file selezionato."
+def add_audio_file(file_paths, current_files_text):
+    """Aggiunge uno o più file audio alla lista."""
+    if not file_paths:
+        return current_files_text, "⚠️ Nessun file selezionato."
 
-    try:
-        # Carica il file per verificare che sia valido
-        segment = AudioSegment.from_file(file_path)
+    added_count = 0
+    skipped_count = 0
+    error_list = []
 
-        # Aggiungi alla lista globale
-        app_state["mother_segments"].append(segment)
+    for file_path in file_paths:
+        try:
+            file_name = file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1]
 
-        # Aggiorna la lista mostrata nell'interfaccia
-        file_name = file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1]
+            # Evita duplicati basati sul nome del file
+            if any(name == file_name for name, seg in app_state["mother_segments"]):
+                print(f"File '{file_name}' già presente, saltato.")
+                skipped_count += 1
+                continue
 
-        # Crea la lista completa dei file
-        if len(app_state["mother_segments"]) == 1:
-            updated_files = f"• {file_name}"
-        else:
-            # Ricostruisci la lista con tutti i file (semplificato per il debug)
-            updated_files = "\n".join([f"• File {i + 1}" for i in range(len(app_state["mother_segments"]))])
+            segment = AudioSegment.from_file(file_path)
+            app_state["mother_segments"].append((file_name, segment))
+            added_count += 1
 
-        return updated_files, f"✅ File '{file_name}' aggiunto con successo! Totale: {len(app_state['mother_segments'])} file(s)."
+        except Exception as e:
+            error_list.append(f"{file_path}: {e}")
 
-    except Exception as e:
-        return current_files, f"❌ Errore nel caricamento del file: {str(e)}"
+    # Aggiorna la lista mostrata nell'interfaccia
+    file_names = [name for name, seg in app_state["mother_segments"]]
+    updated_files_text = "\n".join([f"• {name}" for name in file_names]) or "Nessun file caricato"
+
+    # Crea messaggio di stato
+    status_parts = []
+    if added_count > 0:
+        status_parts.append(f"✅ Aggiunti {added_count} file.")
+    if skipped_count > 0:
+        status_parts.append(f"ℹ️ Saltati {skipped_count} duplicati.")
+    if error_list:
+        status_parts.append(f"❌ {len(error_list)} errori.")
+    
+    if not status_parts:
+         status_message = "ℹ️ Nessun nuovo file aggiunto (potrebbero essere duplicati o errati)."
+    else:
+        status_message = " ".join(status_parts)
+    
+    status_message += f" Totale: {len(app_state['mother_segments'])} file."
+
+    return updated_files_text, status_message
 
 
 def clear_audio_files():
@@ -127,7 +152,7 @@ def clear_audio_files():
 # ── Funzioni per l'interfaccia Gradio ────────────────────────────
 def start_detection():
     """Funzione chiamata dal pulsante 'Avvia'."""
-    if app_state["inference_thread"] is not None and app_state["inference_thread"].is_alive():
+    if app_state.get("monitoring_active"):
         return "Il monitoraggio è già attivo.", create_visual_status("🟢 In Ascolto", "listening"), create_score_display(
             0.0)
 
@@ -156,8 +181,9 @@ def start_detection():
     )
     app_state["pyaudio_thread"].start()
 
-    # Reset dello stato UI
-    app_state["last_ui_state"] = None
+    # Imposta lo stato iniziale per l'UI
+    app_state["monitoring_active"] = True
+    app_state["last_ui_state"] = False  # Inizializza a non rilevato
 
     return (
         f"✅ Monitoraggio avviato! In ascolto con {len(app_state['mother_segments'])} file(s) audio...",
@@ -168,13 +194,15 @@ def start_detection():
 
 def stop_detection():
     """Funzione chiamata dal pulsante 'Ferma'."""
-    if app_state["stop_event"]:
+    if app_state.get("monitoring_active"):
         app_state["stop_event"].set()
 
         # Attendi la terminazione dei thread
         if app_state["pyaudio_thread"]: app_state["pyaudio_thread"].join(timeout=2)
         if app_state["inference_thread"]: app_state["inference_thread"].join(timeout=2)
 
+        # Resetta lo stato globale
+        app_state["monitoring_active"] = False
         app_state["stop_event"] = None
         app_state["inference_thread"] = None
         app_state["pyaudio_thread"] = None
@@ -185,6 +213,8 @@ def stop_detection():
             create_visual_status("⚫ Sistema Spento", "offline"),
             create_score_display(0.0)
         )
+
+    # Se non era attivo, restituisce lo stato di default
     return (
         "Il monitoraggio non era attivo.",
         create_visual_status("⚫ Sistema Spento", "offline"),
@@ -215,36 +245,64 @@ def create_score_display(score):
 def update_ui_complete():
     """Funzione per aggiornare l'UI in tempo reale solo quando necessario."""
     # Se il monitoraggio non è attivo, non fare nulla
-    if app_state["stop_event"] is None or not app_state["inference_thread"] or not app_state[
-        "inference_thread"].is_alive():
+    if not app_state.get("monitoring_active"):
         return gr.skip(), gr.skip(), gr.skip()
 
+    # Controlla se ci sono nuovi risultati nella coda
+    new_results = []
     try:
-        result = result_queue.get_nowait()
-        score = result['score']
-        detected = result['detected']
-
-        # Crea il nuovo stato
-        if detected:
-            status_text = "✅ Monitoraggio attivo - PIANTO RILEVATO!"
-            visual_html = create_visual_status("🚨 PIANTO RILEVATO!", "cry-alert")
-        else:
-            status_text = "✅ Monitoraggio attivo - In ascolto..."
-            visual_html = create_visual_status("🟢 In Ascolto", "listening")
-
-        score_html = create_score_display(score)
-
-        # Controlla se lo stato è cambiato per evitare aggiornamenti non necessari
-        new_state = (status_text, detected, round(score, 3))
-        if app_state["last_ui_state"] == new_state:
-            return gr.skip(), gr.skip(), gr.skip()
-
-        app_state["last_ui_state"] = new_state
-        return status_text, visual_html, score_html
-
+        # Raccoglie tutti i risultati disponibili per processare solo l'ultimo
+        while True:
+            result = result_queue.get_nowait()
+            new_results.append(result)
     except queue.Empty:
-        # Nessun nuovo risultato disponibile
+        pass
+
+    # Se non ci sono nuovi risultati, non aggiornare nulla
+    if not new_results:
         return gr.skip(), gr.skip(), gr.skip()
+
+    # Prendi solo l'ultimo risultato per evitare lag
+    result = new_results[-1]
+    score = result['score']
+    detected = result['detected']
+
+    # Controlla se il punteggio è cambiato significativamente
+    score_changed = abs(score - app_state["current_score"]) > 0.001
+    
+    # Ottieni lo stato di rilevamento precedente
+    last_detected = app_state["last_ui_state"]
+    detection_state_changed = detected != last_detected
+
+    # Se nè lo stato nè il punteggio sono cambiati, non aggiornare nulla
+    if not detection_state_changed and not score_changed:
+        return gr.skip(), gr.skip(), gr.skip()
+
+    # Prepara i nuovi contenuti
+    if detected:
+        new_status_text = "✅ Monitoraggio attivo - PIANTO RILEVATO!"
+        new_visual_html = create_visual_status("🚨 PIANTO RILEVATO!", "cry-alert")
+    else:
+        new_status_text = "✅ Monitoraggio attivo - In ascolto..."
+        new_visual_html = create_visual_status("🟢 In Ascolto", "listening")
+
+    new_score_html = create_score_display(score)
+
+    # Determina cosa aggiornare
+    status_to_return = new_status_text if detection_state_changed else gr.skip()
+    visual_to_return = new_visual_html if detection_state_changed else gr.skip()
+    score_to_return = new_score_html if score_changed else gr.skip()
+
+    # Aggiorna lo stato interno solo se necessario
+    if detection_state_changed:
+        app_state["last_ui_state"] = detected
+        app_state["last_status_text"] = new_status_text
+        app_state["last_visual_html"] = new_visual_html
+    
+    if score_changed:
+        app_state["current_score"] = score
+
+    return status_to_return, visual_to_return, score_to_return
 
 
 # ── CSS personalizzato per l'effetto visivo ─────────────────────
@@ -339,13 +397,15 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
             gr.Markdown("### 🎵 Gestione File Audio")
 
             # Sezione per aggiungere file
-            mother_audio_input = gr.Audio(
-                label="Seleziona File Audio da Aggiungere",
-                type="filepath"
+            mother_audio_input = gr.File(
+                label="Seleziona uno o più file audio da aggiungere",
+                type="filepath",
+                file_count="multiple",
+                file_types=["audio"]
             )
 
             with gr.Row():
-                add_button = gr.Button("➕ Aggiungi File", variant="primary")
+                add_button = gr.Button("➕ Aggiungi File/i", variant="primary")
                 clear_button = gr.Button("🗑️ Rimuovi Tutti", variant="secondary")
 
             # Lista dei file caricati
@@ -421,7 +481,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
     )
 
     # Timer per aggiornamenti UI ottimizzati (solo quando necessario)
-    timer = gr.Timer(value=2.0)  # ogni 2 secondi e SOLO quando il monitoraggio è attivo
+    timer = gr.Timer(value=1.0)  # Ridotto a 1 secondo per maggiore reattività
     timer.tick(
         fn=update_ui_complete,
         outputs=[system_status, visual_status, score_display]
