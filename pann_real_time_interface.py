@@ -5,6 +5,7 @@ import numpy as np
 import pyaudio
 import wave
 import time
+import random
 from panns_inference import SoundEventDetection, labels
 from pydub import AudioSegment
 from pydub.playback import play
@@ -25,7 +26,9 @@ result_queue = queue.Queue()
 app_state = {
     "stop_event": None,
     "inference_thread": None,
-    "pyaudio_thread": None
+    "pyaudio_thread": None,
+    "last_ui_state": None,  # Per evitare aggiornamenti non necessari
+    "mother_segments": []  # Lista di file audio caricati
 }
 
 # ── Modello (caricato una sola volta) ──────────────────────────────
@@ -38,7 +41,7 @@ print("Modello caricato.")
 
 
 # ── Worker per l'inferenza ───────────────
-def inference_worker(mother_segment, stop_event):
+def inference_worker(mother_segments, stop_event):
     """Esegue l'inferenza sui dati audio e mette i risultati in una coda."""
     while not stop_event.is_set():
         try:
@@ -51,9 +54,11 @@ def inference_worker(mother_segment, stop_event):
             detected = score > THRESHOLD
             result_queue.put({"score": score, "detected": detected})
 
-            if detected:
-                print(f"PIANTO RILEVATO (Score: {score:.2f}) - Riproduco audio.")
-                play(mother_segment)
+            if detected and mother_segments:
+                # Seleziona casualmente uno dei file audio caricati
+                selected_segment = random.choice(mother_segments)
+                print(f"PIANTO RILEVATO (Score: {score:.2f}) - Riproduco audio casuale.")
+                play(selected_segment)
 
             audio_queue.task_done()
         except queue.Empty:
@@ -84,27 +89,61 @@ def pyaudio_worker(stop_event):
     print("🔴 Ascolto terminato.")
 
 
+# ── Funzioni per la gestione dei file multipli ────────────────────────────
+def add_audio_file(file_path, current_files):
+    """Aggiunge un file audio alla lista."""
+    if file_path is None:
+        return current_files, "⚠️ Nessun file selezionato."
+
+    try:
+        # Carica il file per verificare che sia valido
+        segment = AudioSegment.from_file(file_path)
+
+        # Aggiungi alla lista globale
+        app_state["mother_segments"].append(segment)
+
+        # Aggiorna la lista mostrata nell'interfaccia
+        file_name = file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1]
+
+        # Crea la lista completa dei file
+        if len(app_state["mother_segments"]) == 1:
+            updated_files = f"• {file_name}"
+        else:
+            # Ricostruisci la lista con tutti i file (semplificato per il debug)
+            updated_files = "\n".join([f"• File {i + 1}" for i in range(len(app_state["mother_segments"]))])
+
+        return updated_files, f"✅ File '{file_name}' aggiunto con successo! Totale: {len(app_state['mother_segments'])} file(s)."
+
+    except Exception as e:
+        return current_files, f"❌ Errore nel caricamento del file: {str(e)}"
+
+
+def clear_audio_files():
+    """Pulisce tutti i file audio caricati."""
+    app_state["mother_segments"].clear()
+    return "Nessun file caricato", "🗑️ Tutti i file sono stati rimossi."
+
+
 # ── Funzioni per l'interfaccia Gradio ────────────────────────────
-def start_detection(mother_audio_path):
+def start_detection():
     """Funzione chiamata dal pulsante 'Avvia'."""
     if app_state["inference_thread"] is not None and app_state["inference_thread"].is_alive():
-        return "Il monitoraggio è già attivo.", "🟢 In Ascolto", "rgba(34, 139, 34, 0.1)", 0.0
+        return "Il monitoraggio è già attivo.", create_visual_status("🟢 In Ascolto", "listening"), create_score_display(
+            0.0)
 
-    if mother_audio_path is None:
-        raise gr.Error("Per favore, carica prima il file audio della mamma.")
+    if not app_state["mother_segments"]:
+        raise gr.Error("Per favore, carica almeno un file audio prima di iniziare.")
 
     # Pulisci le code prima di iniziare
     while not audio_queue.empty(): audio_queue.get()
     while not result_queue.empty(): result_queue.get()
-
-    mother_segment = AudioSegment.from_file(mother_audio_path)
 
     app_state["stop_event"] = threading.Event()
 
     # Avvia il thread di inferenza
     app_state["inference_thread"] = threading.Thread(
         target=inference_worker,
-        args=(mother_segment, app_state["stop_event"]),
+        args=(app_state["mother_segments"], app_state["stop_event"]),
         daemon=True
     )
     app_state["inference_thread"].start()
@@ -117,7 +156,14 @@ def start_detection(mother_audio_path):
     )
     app_state["pyaudio_thread"].start()
 
-    return "✅ Monitoraggio avviato! In ascolto...", "🟢 In Ascolto", "rgba(34, 139, 34, 0.1)", 0.0
+    # Reset dello stato UI
+    app_state["last_ui_state"] = None
+
+    return (
+        f"✅ Monitoraggio avviato! In ascolto con {len(app_state['mother_segments'])} file(s) audio...",
+        create_visual_status("🟢 In Ascolto", "listening"),
+        create_score_display(0.0)
+    )
 
 
 def stop_detection():
@@ -132,28 +178,72 @@ def stop_detection():
         app_state["stop_event"] = None
         app_state["inference_thread"] = None
         app_state["pyaudio_thread"] = None
+        app_state["last_ui_state"] = None
 
-        return "🔴 Monitoraggio fermato.", "⚫ Spento", "rgba(128, 128, 128, 0.1)", 0.0
-    return "Il monitoraggio non era attivo.", "⚫ Spento", "rgba(128, 128, 128, 0.1)", 0.0
+        return (
+            "🔴 Monitoraggio fermato.",
+            create_visual_status("⚫ Sistema Spento", "offline"),
+            create_score_display(0.0)
+        )
+    return (
+        "Il monitoraggio non era attivo.",
+        create_visual_status("⚫ Sistema Spento", "offline"),
+        create_score_display(0.0)
+    )
 
 
-def update_ui():
-    """Funzione per aggiornare l'UI in tempo reale."""
+# ── Funzioni per creare l'HTML dei componenti ─────────────────────
+def create_visual_status(text, css_class):
+    """Crea l'HTML per lo stato visivo."""
+    return f"""
+    <div class="big-status {css_class}">
+        {text}
+    </div>
+    """
+
+
+def create_score_display(score):
+    """Crea l'HTML per il display del punteggio."""
+    return f"""
+    <div class="score-display">
+        📊 Punteggio: {score:.3f} / {THRESHOLD}
+    </div>
+    """
+
+
+# ── Aggiornamento UI ottimizzato per evitare il blinking ─────────────────────
+def update_ui_complete():
+    """Funzione per aggiornare l'UI in tempo reale solo quando necessario."""
+    # Se il monitoraggio non è attivo, non fare nulla
+    if app_state["stop_event"] is None or not app_state["inference_thread"] or not app_state[
+        "inference_thread"].is_alive():
+        return gr.skip(), gr.skip(), gr.skip()
+
     try:
         result = result_queue.get_nowait()
         score = result['score']
+        detected = result['detected']
 
-        if result['detected']:
-            status_text = "🚨 PIANTO RILEVATO!"
-            bg_color = "rgba(255, 0, 0, 0.2)"  # Rosso con trasparenza
-            return status_text, bg_color, score
+        # Crea il nuovo stato
+        if detected:
+            status_text = "✅ Monitoraggio attivo - PIANTO RILEVATO!"
+            visual_html = create_visual_status("🚨 PIANTO RILEVATO!", "cry-alert")
         else:
-            status_text = "🟢 In Ascolto"
-            bg_color = "rgba(34, 139, 34, 0.1)"  # Verde con trasparenza
-            return status_text, bg_color, score
+            status_text = "✅ Monitoraggio attivo - In ascolto..."
+            visual_html = create_visual_status("🟢 In Ascolto", "listening")
+
+        score_html = create_score_display(score)
+
+        # Controlla se lo stato è cambiato per evitare aggiornamenti non necessari
+        new_state = (status_text, detected, round(score, 3))
+        if app_state["last_ui_state"] == new_state:
+            return gr.skip(), gr.skip(), gr.skip()
+
+        app_state["last_ui_state"] = new_state
+        return status_text, visual_html, score_html
 
     except queue.Empty:
-        # Se non ci sono nuovi risultati, mantieni lo stato attuale
+        # Nessun nuovo risultato disponibile
         return gr.skip(), gr.skip(), gr.skip()
 
 
@@ -213,33 +303,74 @@ custom_css = """
     border-radius: 10px !important;
     background: rgba(240, 240, 240, 0.8) !important;
 }
+
+.file-list {
+    background: rgba(240, 248, 255, 0.8) !important;
+    border: 1px solid #87ceeb !important;
+    border-radius: 8px !important;
+    padding: 10px !important;
+    font-family: monospace !important;
+    white-space: pre-line !important;
+    max-height: 150px !important;
+    overflow-y: auto !important;
+}
 """
 
 # ── Interfaccia Gradio con elementi visivi migliorati ─────────────────────
 with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
     gr.Markdown(
         """
-        # 👶 Baby Cry Detector 🎶
+        # 👶 Baby Cry Detector 🎶 (Multi-File Edition)
         **Soglia di rilevamento fissa: 0.2**
 
+        **Novità:**
+        - ✨ **Supporto per file multipli**: Carica più file audio e il sistema ne sceglierà uno casualmente quando rileva il pianto
+        - 🚀 **Interface ottimizzata**: Niente più blinking durante gli aggiornamenti
+
         **Come funziona:**
-        1. Carica un file audio (MP3, WAV) con una voce o una melodia tranquillizzante
+        1. Carica uno o più file audio (MP3, WAV) con voci o melodie tranquillizzanti
         2. Clicca su **Avvia Monitoraggio** per iniziare l'ascolto
-        3. Quando viene rilevato il pianto, vedrai un grande allarme rosso lampeggiante!
+        3. Quando viene rilevato il pianto, il sistema riprodurrà casualmente uno dei file caricati!
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
+            gr.Markdown("### 🎵 Gestione File Audio")
+
+            # Sezione per aggiungere file
             mother_audio_input = gr.Audio(
-                label="🎵 Carica Voce della Mamma (o melodia)",
+                label="Seleziona File Audio da Aggiungere",
                 type="filepath"
             )
+
+            with gr.Row():
+                add_button = gr.Button("➕ Aggiungi File", variant="primary")
+                clear_button = gr.Button("🗑️ Rimuovi Tutti", variant="secondary")
+
+            # Lista dei file caricati
+            file_list_display = gr.Textbox(
+                label="📁 File Caricati",
+                value="Nessun file caricato",
+                interactive=False,
+                lines=4,
+                elem_classes=["file-list"]
+            )
+
+            file_status = gr.Textbox(
+                label="📋 Stato File",
+                value="Pronto per aggiungere file...",
+                interactive=False,
+                lines=2
+            )
+
+            gr.Markdown("### 🎯 Controlli Monitoraggio")
+
             with gr.Row():
                 start_button = gr.Button("▶️ Avvia Monitoraggio", variant="primary", size="lg")
                 stop_button = gr.Button("⏹️ Ferma Monitoraggio", variant="stop", size="lg")
 
-            status_box = gr.Textbox(
+            system_status = gr.Textbox(
                 label="📋 Stato del Sistema",
                 value="Pronto per iniziare...",
                 interactive=False,
@@ -251,101 +382,49 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
 
             # Grande display dello stato visivo
             visual_status = gr.HTML(
-                value="""
-                <div class="big-status offline">
-                    ⚫ Sistema Spento
-                </div>
-                """,
+                value=create_visual_status("⚫ Sistema Spento", "offline"),
                 label="Stato Visivo"
             )
 
             # Display del punteggio
             score_display = gr.HTML(
-                value="""
-                <div class="score-display">
-                    📊 Punteggio: 0.00
-                </div>
-                """,
+                value=create_score_display(0.0),
                 label="Punteggio Rilevamento"
             )
 
+    # ── Logica di interazione dei componenti ─────────────────────
 
-    # Funzione per aggiornare l'HTML dello stato visivo
-    def update_visual_status(status_text, bg_color, score):
-        if "PIANTO RILEVATO" in status_text:
-            css_class = "cry-alert"
-        elif "In Ascolto" in status_text:
-            css_class = "listening"
-        else:
-            css_class = "offline"
+    # Gestione file
+    add_button.click(
+        fn=add_audio_file,
+        inputs=[mother_audio_input, file_list_display],
+        outputs=[file_list_display, file_status]
+    )
 
-        visual_html = f"""
-        <div class="big-status {css_class}">
-            {status_text}
-        </div>
-        """
+    clear_button.click(
+        fn=clear_audio_files,
+        inputs=None,
+        outputs=[file_list_display, file_status]
+    )
 
-        score_html = f"""
-        <div class="score-display">
-            📊 Punteggio: {score:.3f} / {THRESHOLD}
-        </div>
-        """
-
-        return visual_html, score_html
-
-
-    # Funzioni semplificate per i pulsanti
-    def start_ui_update(mother_audio_path):
-        status, visual_text, _, score = start_detection(mother_audio_path)
-        visual_html, score_html = update_visual_status(visual_text, "", score)
-        return status, visual_html, score_html
-
-
-    def stop_ui_update():
-        status, visual_text, _, score = stop_detection()
-        visual_html, score_html = update_visual_status(visual_text, "", score)
-        return status, visual_html, score_html
-
-
-    # Aggiornamento UI in tempo reale
-    def update_ui_complete():
-        try:
-            result = result_queue.get_nowait()
-            score = result['score']
-
-            if result['detected']:
-                status_text = "✅ Monitoraggio attivo - PIANTO RILEVATO!"
-                visual_text = "🚨 PIANTO RILEVATO!"
-                visual_html, score_html = update_visual_status(visual_text, "", score)
-                return status_text, visual_html, score_html
-            else:
-                status_text = "✅ Monitoraggio attivo - In ascolto..."
-                visual_text = "🟢 In Ascolto"
-                visual_html, score_html = update_visual_status(visual_text, "", score)
-                return status_text, visual_html, score_html
-
-        except queue.Empty:
-            return gr.skip(), gr.skip(), gr.skip()
-
-
-    # Logica di interazione dei componenti
+    # Controlli monitoraggio
     start_button.click(
-        fn=start_ui_update,
-        inputs=[mother_audio_input],
-        outputs=[status_box, visual_status, score_display]
+        fn=start_detection,
+        inputs=None,
+        outputs=[system_status, visual_status, score_display]
     )
 
     stop_button.click(
-        fn=stop_ui_update,
+        fn=stop_detection,
         inputs=None,
-        outputs=[status_box, visual_status, score_display]
+        outputs=[system_status, visual_status, score_display]
     )
 
-    # ───> qui sostituiamo `demo.load(every=0.5)` con un Timer <───
-    timer = gr.Timer(value=0.5)  # ogni 0.5 secondi
+    # Timer per aggiornamenti UI ottimizzati (solo quando necessario)
+    timer = gr.Timer(value=2.0)  # ogni 2 secondi e SOLO quando il monitoraggio è attivo
     timer.tick(
         fn=update_ui_complete,
-        outputs=[status_box, visual_status, score_display]
+        outputs=[system_status, visual_status, score_display]
     )
 
 # Avvia l'interfaccia
